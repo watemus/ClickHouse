@@ -1,5 +1,6 @@
 #include <any>
 #include <limits>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -28,6 +29,15 @@
 #include <Common/typeid_cast.h>
 #include <Common/assert_cast.h>
 
+#include <IO/WriteBuffer.h>
+#include <IO/WriteBufferFromTemporaryFile.h>
+#include <Interpreters/TemporaryDataOnDisk.h>
+#include <Common/filesystemHelpers.h>
+#include <Formats/NativeWriter.h>
+#include <Formats/NativeReader.h>
+#include <IO/WriteBufferFromFile.h>
+#include <Poco/TemporaryFile.h>
+
 namespace DB
 {
 
@@ -43,6 +53,143 @@ namespace ErrorCodes
     extern const int TYPE_MISMATCH;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
+
+enum class RightBlockState
+{
+    DEFAULT,
+    IN_MEMORY_COMPRESSED,
+    EXTERNAL_MEMORY,
+};
+
+class RightBlock
+{
+public:
+    template <typename BlockType>
+    RightBlock(const Block & right_sample_block_, BlockType && block_) 
+        : right_sample_block(right_sample_block_)
+        , block(std::forward<BlockType>(block_))
+        , num_rows(block_.rows())
+        , num_bytes(block_.bytes())
+    {
+    }
+    void makeDefault()
+    {
+        if (state == RightBlockState::IN_MEMORY_COMPRESSED)
+        {
+            for (auto & column : block)
+            {
+                column.column = column.column->decompress();
+            }
+        }
+        else if (state == RightBlockState::EXTERNAL_MEMORY)
+        {
+            {
+                ReadBufferFromFile buffer(file->path());
+                NativeReader block_reader(buffer, 0);
+                block = block_reader.read();
+            }
+            LOG_DEBUG(&Poco::Logger::get("HashJoin"), "Move block from tmp file: {}", file->path());
+            file.reset();
+        }
+        state = RightBlockState::DEFAULT;
+    }
+
+    void makeCompressed()
+    {
+        makeDefault();
+        for (auto & column : block)
+        {
+            column.column = column.column->compress();
+        }
+        state = RightBlockState::IN_MEMORY_COMPRESSED;
+    }
+
+    void makeExternal()
+    {
+        makeDefault();
+        file = std::make_shared<Poco::TemporaryFile>();
+        LOG_DEBUG(&Poco::Logger::get("HashJoin"), "Move block to tmp file: {}", file->path());
+        WriteBufferFromFile buffer(file->path());
+        NativeWriter block_writer(buffer, 0, right_sample_block);
+        block_writer.write(block);
+        block.clear();
+        state = RightBlockState::EXTERNAL_MEMORY;
+    }
+
+    void setState(RightBlockState new_state)
+    {
+        if (new_state == RightBlockState::DEFAULT)
+        {
+            makeDefault();
+        }
+        else if (new_state == RightBlockState::IN_MEMORY_COMPRESSED)
+        {
+            makeCompressed();
+        }
+        else if (new_state == RightBlockState::EXTERNAL_MEMORY)
+        {
+            makeExternal();
+        }
+    }
+
+    RightBlockState getState()
+    {
+        return state;
+    }
+
+    Block & operator*()
+    {
+        return block;
+    }
+
+    const Block & operator*() const
+    {
+        return block;
+    }
+
+    Block * operator->()
+    {
+        return &block;
+    }
+
+    const Block * operator->() const
+    {
+        return &block;
+    }
+
+    size_t rows() const {
+        return num_rows;
+    }
+
+    size_t bytes() const {
+        return num_bytes;
+    }
+private:
+    const Block & right_sample_block;
+    Block block;
+    RightBlockState state = RightBlockState::DEFAULT;
+    size_t num_rows;
+    size_t num_bytes;
+    std::shared_ptr<Poco::TemporaryFile> file;
+};
+
+class BlockGuard
+{
+public:
+    explicit BlockGuard(RightBlock & block_)
+        : block(block_)
+        , state(block_.getState())
+    {
+        LOG_DEBUG(&Poco::Logger::get("HashJoin"), "BLOCK LOCKED");
+        block.makeDefault();
+    }
+    ~BlockGuard() {
+        block.setState(state);
+    }
+private:
+    RightBlock & block;
+    RightBlockState state;
+};
 
 namespace
 {
@@ -691,8 +838,20 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
             throw DB::Exception("addJoinedBlock called when HashJoin locked to prevent updates",
                                 ErrorCodes::LOGICAL_ERROR);
 
-        data->blocks.emplace_back(std::move(structured_block));
-        Block * stored_block = &data->blocks.back();
+        data->blocks.emplace_back(right_sample_block, std::move(structured_block));
+        Block * stored_block = &*data->blocks.back();
+        
+        if (kind == JoinKind::Cross)
+        {
+            bool large = false;
+            bool very_large = true;
+            if (large)
+                data->blocks.back().makeCompressed();
+            else if (very_large)
+                data->blocks.back().makeExternal();
+        }
+
+        LOG_DEBUG(log, "INSERTED ROWS IN BLOCK: {}", data->blocks.back()->rows());
 
         if (rows)
             data->empty = false;
@@ -1570,8 +1729,10 @@ void HashJoin::joinBlockImplCross(Block & block, ExtraBlockPtr & not_processed) 
     for (size_t left_row = start_left_row; left_row < rows_left; ++left_row)
     {
         size_t block_number = 0;
-        for (const Block & block_right : data->blocks)
+        for (RightBlock & block_right : data->blocks)
         {
+            BlockGuard lock(block_right);
+
             ++block_number;
             if (block_number < start_right_block)
                 continue;
@@ -1579,12 +1740,14 @@ void HashJoin::joinBlockImplCross(Block & block, ExtraBlockPtr & not_processed) 
             size_t rows_right = block_right.rows();
             rows_added += rows_right;
 
+            LOG_DEBUG(log, "GET ROWS IN BLOCK: {}", block_right->rows());
+
             for (size_t col_num = 0; col_num < num_existing_columns; ++col_num)
                 dst_columns[col_num]->insertManyFrom(*src_left_columns[col_num], left_row, rows_right);
 
             for (size_t col_num = 0; col_num < num_columns_to_add; ++col_num)
             {
-                const IColumn & column_right = *block_right.getByPosition(col_num).column;
+                const IColumn & column_right = *block_right->getByPosition(col_num).column;
                 dst_columns[num_existing_columns + col_num]->insertRangeFrom(column_right, 0, rows_right);
             }
         }
@@ -1604,6 +1767,7 @@ void HashJoin::joinBlockImplCross(Block & block, ExtraBlockPtr & not_processed) 
         block.insert(src_column);
 
     block = block.cloneWithColumns(std::move(dst_columns));
+    LOG_DEBUG(log, "ADDED ROWS IN BLOCK: {}", block.rows());
 }
 
 DataTypePtr HashJoin::joinGetCheckAndGetReturnType(const DataTypes & data_types, const String & column_name, bool or_null) const
@@ -1802,23 +1966,27 @@ private:
 
     std::any position;
     std::optional<HashJoin::BlockNullmapList::const_iterator> nulls_position;
-    std::optional<BlocksList::const_iterator> used_position;
 
-    size_t fillColumnsFromData(const BlocksList & blocks, MutableColumns & columns_right)
+    using RightBlocksListIterator = RightBlocksList::iterator;
+
+    std::optional<RightBlocksListIterator> used_position;
+
+    size_t fillColumnsFromData(RightBlocksList & blocks, MutableColumns & columns_right)
     {
         if (!position.has_value())
-            position = std::make_any<BlocksList::const_iterator>(blocks.begin());
+            position = std::make_any<RightBlocksListIterator>(blocks.begin());
 
-        auto & block_it = std::any_cast<BlocksList::const_iterator &>(position);
+        auto & block_it = std::any_cast<RightBlocksListIterator &>(position);
         auto end = blocks.end();
 
         size_t rows_added = 0;
         for (; block_it != end; ++block_it)
         {
+            BlockGuard lock(*block_it);
             size_t rows_from_block = std::min<size_t>(max_block_size - rows_added, block_it->rows() - current_block_start);
             for (size_t j = 0; j < columns_right.size(); ++j)
             {
-                const auto & col = block_it->getByPosition(j).column;
+                const auto & col = (*block_it)->getByPosition(j).column;
                 columns_right[j]->insertRangeFrom(*col, current_block_start, rows_from_block);
             }
             rows_added += rows_from_block;
@@ -1871,15 +2039,16 @@ private:
 
             for (auto & it = *used_position; it != end && rows_added < max_block_size; ++it)
             {
-                const Block & mapped_block = *it;
+                RightBlock & mapped_block = *it;
+                BlockGuard lock(mapped_block);
 
                 for (size_t row = 0; row < mapped_block.rows(); ++row)
                 {
-                    if (!parent.isUsed(&mapped_block, row))
+                    if (!parent.isUsed(&(*mapped_block), row))
                     {
                         for (size_t colnum = 0; colnum < columns_keys_and_right.size(); ++colnum)
                         {
-                            columns_keys_and_right[colnum]->insertFrom(*mapped_block.getByPosition(colnum).column, row);
+                            columns_keys_and_right[colnum]->insertFrom(*mapped_block->getByPosition(colnum).column, row);
                         }
 
                         ++rows_added;
@@ -1992,7 +2161,7 @@ void HashJoin::reuseJoinedData(const HashJoin & join)
 
 BlocksList HashJoin::releaseJoinedBlocks()
 {
-    BlocksList right_blocks = std::move(data->blocks);
+    RightBlocksList right_blocks = std::move(data->blocks);
     data->released = true;
     BlocksList restored_blocks;
 
@@ -2002,20 +2171,22 @@ BlocksList HashJoin::releaseJoinedBlocks()
     if (!right_blocks.empty())
     {
         positions.reserve(right_sample_block.columns());
-        const Block & tmp_block = *right_blocks.begin();
+        RightBlock & tmp_block = *right_blocks.begin();
+        BlockGuard lock(tmp_block);
         for (const auto & sample_column : right_sample_block)
         {
-            positions.emplace_back(tmp_block.getPositionByName(sample_column.name));
+            positions.emplace_back(tmp_block->getPositionByName(sample_column.name));
             is_nullable.emplace_back(JoinCommon::isNullable(sample_column.type));
         }
     }
 
-    for (Block & saved_block : right_blocks)
+    for (RightBlock & saved_block : right_blocks)
     {
+        BlockGuard lock(saved_block);
         Block restored_block;
         for (size_t i = 0; i < positions.size(); ++i)
         {
-            auto & column = saved_block.getByPosition(positions[i]);
+            auto & column = saved_block->getByPosition(positions[i]);
             correctNullabilityInplace(column, is_nullable[i]);
             restored_block.insert(column);
         }

@@ -17,6 +17,10 @@
 #include <Common/HashTable/FixedHashMap.h>
 #include <Storages/TableLockHolder.h>
 #include <Common/logger_useful.h>
+#include <IO/WriteBufferFromTemporaryFile.h>
+#include <Interpreters/TemporaryDataOnDisk.h>
+#include <QueryPipeline/BlockIO.h>
+#include <Formats/NativeWriter.h>
 
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnFixedString.h>
@@ -32,6 +36,9 @@ namespace DB
 {
 
 class TableJoin;
+class RightBlock;
+
+using RightBlocksList = std::vector<RightBlock>;
 
 namespace JoinStuff
 {
@@ -330,7 +337,7 @@ public:
 
         std::vector<MapsVariant> maps;
         Block sample_block; /// Block as it would appear in the BlockList
-        BlocksList blocks; /// Blocks of "right" table.
+        RightBlocksList blocks; /// Blocks of "right" table.
         BlockNullmapList blocks_nullmaps; /// Nullmaps for blocks of "right" table (if needed)
 
         /// Additional data - strings for string keys and continuation elements of single-linked lists of references to rows.
